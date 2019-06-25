@@ -401,20 +401,7 @@ public class AmazonS3ClientMock extends AbstractAmazonS3 {
 
     @Override
     public CopyObjectResult copyObject(String sourceBucketName, String sourceKey, String destinationBucketName, String destinationKey) throws AmazonClientException {
-        Path src = find(sourceBucketName, sourceKey);
-        if (src != null && Files.exists(src)) {
-            Path bucket = find(destinationBucketName);
-            Path dest = bucket.resolve(destinationKey.replaceAll("/", "%2F"));
-            try {
-                Files.copy(src, dest, StandardCopyOption.REPLACE_EXISTING);
-            } catch (IOException e) {
-                throw new AmazonServiceException("Problem copying mock objects: ", e);
-            }
-
-            return new CopyObjectResult();
-        }
-
-        throw new AmazonServiceException("object source not found");
+        return copyObject(new CopyObjectRequest(sourceBucketName, sourceKey, destinationBucketName, destinationKey));
     }
 
     @Override
@@ -976,8 +963,22 @@ public class AmazonS3ClientMock extends AbstractAmazonS3 {
     }
 
     @Override
-    public CopyObjectResult copyObject(CopyObjectRequest copyObjectRequest) throws AmazonClientException {
-        throw new UnsupportedOperationException();
+    public CopyObjectResult copyObject(CopyObjectRequest request) throws AmazonClientException {
+        Path src = find(request.getSourceBucketName(), request.getSourceKey());
+        if (src != null && Files.exists(src)) {
+            Path bucket = find(request.getDestinationBucketName());
+            Path dest = bucket.resolve(request.getDestinationKey().replaceAll("/", "%2F"));
+            try {
+                Files.copy(src, dest, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException e) {
+                throw new AmazonServiceException("Problem copying mock objects: ", e);
+            }
+
+            return new CopyObjectResult();
+        }
+
+        throw new AmazonServiceException("object source not found");
+
     }
 
     @Override
