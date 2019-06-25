@@ -2,15 +2,11 @@ package com.upplication.s3fs;
 
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.internal.Constants;
-import com.amazonaws.services.s3.model.AmazonS3Exception;
-import com.amazonaws.services.s3.model.Bucket;
-import com.amazonaws.services.s3.model.ObjectMetadata;
-import com.amazonaws.services.s3.model.S3Object;
+import com.amazonaws.services.s3.model.*;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
-import com.sun.nio.file.ExtendedOpenOption;
 import com.upplication.s3fs.attribute.S3BasicFileAttributeView;
 import com.upplication.s3fs.attribute.S3BasicFileAttributes;
 import com.upplication.s3fs.attribute.S3PosixFileAttributeView;
@@ -18,17 +14,12 @@ import com.upplication.s3fs.attribute.S3PosixFileAttributes;
 import com.upplication.s3fs.util.AttributesUtils;
 import com.upplication.s3fs.util.Cache;
 import com.upplication.s3fs.util.S3Utils;
-import sun.nio.ch.FileChannelImpl;
 
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 import java.net.URI;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.channels.SeekableByteChannel;
-import java.nio.channels.WritableByteChannel;
 import java.nio.file.*;
 import java.nio.file.attribute.*;
 import java.nio.file.spi.FileSystemProvider;
@@ -493,12 +484,78 @@ public class S3FileSystemProvider extends FileSystemProvider {
         String keySource = s3Source.getKey();
         String bucketNameTarget = s3Target.getFileStore().name();
         String keyTarget = s3Target.getKey();
-        s3Source.getFileSystem()
-                .getClient().copyObject(
-                bucketNameOrigin,
-                keySource,
-                bucketNameTarget,
-                keyTarget);
+
+        AmazonS3 client = s3Source.getFileSystem().getClient();
+        ObjectMetadata metadata = client.getObjectMetadata(bucketNameOrigin, keySource);
+        copy(client, metadata.clone(), bucketNameOrigin, keySource, bucketNameTarget, keyTarget);
+    }
+
+    /** Do a copy from source to target, using a single request if <5GB, and a multipart copy if larger */
+    public static void copy(AmazonS3 client, ObjectMetadata metadata, String sourceBucketName, String sourceKey, String targetBucketName, String targetKey) throws IOException {
+        try {
+            long objectSize = metadata.getContentLength();
+            // S3 doesn't support single-copy requests when the object is >5GB, so use a multi-part approach when needed
+            // Taken from https://docs.aws.amazon.com/AmazonS3/latest/dev/CopyingObjctsUsingLLJavaMPUapi.html
+
+            long partSize = 5L * 1024L * 1024L * 1024L - 1; // 5GB minus 1 byte chunks
+            if (objectSize > partSize) {
+
+                InitiateMultipartUploadRequest initRequest = new InitiateMultipartUploadRequest(targetBucketName, targetKey, metadata);
+                InitiateMultipartUploadResult initResult = client.initiateMultipartUpload(initRequest);
+
+                long bytePosition = 0;
+                int partNum = 1;
+                List<CopyPartResult> copyResponses = new ArrayList<>();
+                while (bytePosition < objectSize) {
+                    // The last part might be smaller than partSize, so check to make sure
+                    // that lastByte isn't beyond the end of the object.
+                    long lastByte = Math.min(bytePosition + partSize - 1, objectSize - 1);
+
+                    // Copy this part.
+                    CopyPartRequest copyRequest = new CopyPartRequest()
+                            .withSourceBucketName(sourceBucketName)
+                            .withSourceKey(sourceKey)
+                            .withDestinationBucketName(targetBucketName)
+                            .withDestinationKey(targetKey)
+                            .withUploadId(initResult.getUploadId())
+                            .withFirstByte(bytePosition)
+                            .withLastByte(lastByte)
+                            .withPartNumber(partNum++);
+                    copyResponses.add(client.copyPart(copyRequest));
+                    bytePosition += partSize;
+                }
+
+                // Complete the upload request to concatenate all uploaded parts and make the copied object available.
+                CompleteMultipartUploadRequest completeRequest = new CompleteMultipartUploadRequest(
+                        sourceBucketName,
+                        sourceKey,
+                        initResult.getUploadId(),
+                        getETags(copyResponses));
+                client.completeMultipartUpload(completeRequest);
+            } else {
+                CopyObjectRequest request = new CopyObjectRequest(sourceBucketName, sourceKey, targetBucketName, targetKey)
+                        .withNewObjectMetadata(metadata);
+
+                client.copyObject(request);
+            }
+        }
+        catch (AmazonS3Exception e) {
+            if (e.getStatusCode() == 404) {
+                FileNotFoundException notFoundException = new FileNotFoundException(e.getMessage());
+                notFoundException.initCause(e);
+                throw notFoundException;
+            }
+            throw e;
+        }
+    }
+
+    // This is a helper function to construct a list of ETags.
+    private static List<PartETag> getETags(List<CopyPartResult> responses) {
+        List<PartETag> etags = new ArrayList<>();
+        for (CopyPartResult response : responses) {
+            etags.add(new PartETag(response.getPartNumber(), response.getETag()));
+        }
+        return etags;
     }
 
     @Override
