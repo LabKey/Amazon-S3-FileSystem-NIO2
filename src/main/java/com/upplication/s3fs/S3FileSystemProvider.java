@@ -1,8 +1,13 @@
 package com.upplication.s3fs;
 
+import com.amazonaws.client.builder.ExecutorFactory;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.internal.Constants;
 import com.amazonaws.services.s3.model.*;
+import com.amazonaws.services.s3.transfer.Copy;
+import com.amazonaws.services.s3.transfer.TransferManager;
+import com.amazonaws.services.s3.transfer.TransferManagerBuilder;
+import com.amazonaws.services.s3.transfer.Upload;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -62,6 +67,7 @@ public class S3FileSystemProvider extends FileSystemProvider {
 
     public static final String CHARSET_KEY = "s3fs_charset";
     public static final String AMAZON_S3_FACTORY_CLASS = "s3fs_amazon_s3_factory";
+    public static final long PARALLEL_SIZE_THRESHOLD = 16 * 1024 * 1024l;
 
     private static final ConcurrentMap<String, S3FileSystem> fileSystems = new ConcurrentHashMap<>();
     private static final List<String> PROPS_TO_OVERLOAD = Arrays.asList(ACCESS_KEY, SECRET_KEY, REQUEST_METRIC_COLLECTOR_CLASS, CONNECTION_TIMEOUT, MAX_CONNECTIONS, MAX_ERROR_RETRY, PROTOCOL, PROXY_DOMAIN,
@@ -490,52 +496,45 @@ public class S3FileSystemProvider extends FileSystemProvider {
         copy(client, metadata.clone(), bucketNameOrigin, keySource, bucketNameTarget, keyTarget);
     }
 
-    /** Do a copy from source to target, using a single request if <5GB, and a multipart copy if larger */
+    /** Do a copy from source to target, using a TransferManager for a parallelized copy */
     public static void copy(AmazonS3 client, ObjectMetadata metadata, String sourceBucketName, String sourceKey, String targetBucketName, String targetKey) throws IOException {
         try {
-            long objectSize = metadata.getContentLength();
-            // S3 doesn't support single-copy requests when the object is >5GB, so use a multi-part approach when needed
-            // Taken from https://docs.aws.amazon.com/AmazonS3/latest/dev/CopyingObjctsUsingLLJavaMPUapi.html
+            final long objectSize = metadata.getContentLength();
 
-            long partSize = 5L * 1024L * 1024L * 1024L - 1; // 5GB minus 1 byte chunks
-            if (objectSize > partSize) {
+            CopyObjectRequest request = new CopyObjectRequest(sourceBucketName, sourceKey, targetBucketName, targetKey)
+                    .withNewObjectMetadata(metadata);
 
-                InitiateMultipartUploadRequest initRequest = new InitiateMultipartUploadRequest(targetBucketName, targetKey, metadata);
-                InitiateMultipartUploadResult initResult = client.initiateMultipartUpload(initRequest);
+            if (objectSize > PARALLEL_SIZE_THRESHOLD) {
+                TransferManager tm = TransferManagerBuilder.standard()
+                        .withS3Client(client)
+                        .withExecutorFactory(new ExecutorFactory() {
+                            @Override
+                            public ExecutorService newExecutor() {
+                                // For files up to 1GB, use 10 parallel requests, but go to 20 for anything bigger
+                                return Executors.newFixedThreadPool(objectSize > (1024L * 1024L * 1204L) ? 20 : 10);
+                            }
+                        })
+                        .build();
 
-                long bytePosition = 0;
-                int partNum = 1;
-                List<CopyPartResult> copyResponses = new ArrayList<>();
-                while (bytePosition < objectSize) {
-                    // The last part might be smaller than partSize, so check to make sure
-                    // that lastByte isn't beyond the end of the object.
-                    long lastByte = Math.min(bytePosition + partSize - 1, objectSize - 1);
+                try {
+                    // TransferManager processes all transfers asynchronously,
+                    // so this call returns immediately.
+                    Copy copy = tm.copy(request);
 
-                    // Copy this part.
-                    CopyPartRequest copyRequest = new CopyPartRequest()
-                            .withSourceBucketName(sourceBucketName)
-                            .withSourceKey(sourceKey)
-                            .withDestinationBucketName(targetBucketName)
-                            .withDestinationKey(targetKey)
-                            .withUploadId(initResult.getUploadId())
-                            .withFirstByte(bytePosition)
-                            .withLastByte(lastByte)
-                            .withPartNumber(partNum++);
-                    copyResponses.add(client.copyPart(copyRequest));
-                    bytePosition += partSize;
+                    // Wait for the upload to finish before continuing.
+                    try {
+                        copy.waitForCompletion();
+                    } catch (InterruptedException e) {
+                        throw new IOException(e);
+                    }
                 }
-
-                // Complete the upload request to concatenate all uploaded parts and make the copied object available.
-                CompleteMultipartUploadRequest completeRequest = new CompleteMultipartUploadRequest(
-                        sourceBucketName,
-                        sourceKey,
-                        initResult.getUploadId(),
-                        getETags(copyResponses));
-                client.completeMultipartUpload(completeRequest);
-            } else {
-                CopyObjectRequest request = new CopyObjectRequest(sourceBucketName, sourceKey, targetBucketName, targetKey)
-                        .withNewObjectMetadata(metadata);
-
+                finally
+                {
+                    tm.shutdownNow(false);
+                }
+            }
+            else
+            {
                 client.copyObject(request);
             }
         }

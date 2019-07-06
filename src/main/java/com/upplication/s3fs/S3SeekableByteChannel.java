@@ -136,7 +136,7 @@ public class S3SeekableByteChannel implements SeekableByteChannel {
         AmazonS3 client = path.getFileSystem().getClient();
         // Uploads of > 5GB have to be done using a multipart upload instead of a single PUT, but we can get better
         // perf by allowing the parallelization of uploads for reasonably large files as well.
-        if (size > 16 * 1024 * 1024)
+        if (size > S3FileSystemProvider.PARALLEL_SIZE_THRESHOLD)
         {
             TransferManager tm = TransferManagerBuilder.standard()
                     .withExecutorFactory(EXECUTOR_FACTORY)
