@@ -7,7 +7,6 @@ import com.amazonaws.services.s3.model.*;
 import com.amazonaws.services.s3.transfer.Copy;
 import com.amazonaws.services.s3.transfer.TransferManager;
 import com.amazonaws.services.s3.transfer.TransferManagerBuilder;
-import com.amazonaws.services.s3.transfer.Upload;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -334,10 +333,7 @@ public class S3FileSystemProvider extends FileSystemProvider {
 
             return res;
         } catch (AmazonS3Exception e) {
-            if (e.getStatusCode() == 404)
-                throw new NoSuchFileException(path.toString());
-            // otherwise throws a generic IO exception
-            throw new IOException(String.format("Cannot access file: %s", path), e);
+            return translateAndThrowS3Exception(e, path);
         }
     }
 
@@ -493,11 +489,11 @@ public class S3FileSystemProvider extends FileSystemProvider {
 
         AmazonS3 client = s3Source.getFileSystem().getClient();
         ObjectMetadata metadata = client.getObjectMetadata(bucketNameOrigin, keySource);
-        copy(client, metadata.clone(), bucketNameOrigin, keySource, bucketNameTarget, keyTarget);
+        copy(client, metadata.clone(), bucketNameOrigin, keySource, bucketNameTarget, keyTarget, source);
     }
 
     /** Do a copy from source to target, using a TransferManager for a parallelized copy */
-    public static void copy(AmazonS3 client, ObjectMetadata metadata, String sourceBucketName, String sourceKey, String targetBucketName, String targetKey) throws IOException {
+    public static void copy(AmazonS3 client, ObjectMetadata metadata, String sourceBucketName, String sourceKey, String targetBucketName, String targetKey, Path pathForException) throws IOException {
         try {
             final long objectSize = metadata.getContentLength();
 
@@ -539,13 +535,19 @@ public class S3FileSystemProvider extends FileSystemProvider {
             }
         }
         catch (AmazonS3Exception e) {
-            if (e.getStatusCode() == 404) {
-                FileNotFoundException notFoundException = new FileNotFoundException(e.getMessage());
-                notFoundException.initCause(e);
-                throw notFoundException;
-            }
-            throw e;
+            translateAndThrowS3Exception(e, pathForException);
         }
+    }
+
+    public static <T> T translateAndThrowS3Exception(AmazonS3Exception e, Path path) throws IOException {
+        if (e.getStatusCode() == 404) {
+            NoSuchFileException notFoundException = new NoSuchFileException(e.getMessage());
+            notFoundException.initCause(e);
+            throw notFoundException;
+        }
+
+        // otherwise throws a generic IO exception
+        throw new IOException(String.format("Problem attempting to operate on %s", path), e);
     }
 
     // This is a helper function to construct a list of ETags.
@@ -602,7 +604,7 @@ public class S3FileSystemProvider extends FileSystemProvider {
     public <V extends FileAttributeView> V getFileAttributeView(Path path, Class<V> type, LinkOption... options) {
         S3Path s3Path = toS3Path(path);
         if (type == BasicFileAttributeView.class) {
-            return (V) new S3BasicFileAttributeView(s3Path);
+            return (V) new S3BasicFileAttributeView(s3Path, path);
         } else if (type == PosixFileAttributeView.class) {
             return (V) new S3PosixFileAttributeView(s3Path);
         } else if (type == null) {
